@@ -20,30 +20,41 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            set -euo pipefail   # <---- this is the line you add
-            echo "✅ Starting deployment at $(date)"
+            set -euo pipefail
+            echo "🚀 Starting deployment at $(date)"
 
             APP_DIR=${{ secrets.VPS_APP_PATH }}
             SERVICE=${{ secrets.SERVICE_NAME }}
 
+            echo "📂 Ensuring app directory exists: $APP_DIR"
             sudo mkdir -p "$APP_DIR"
             sudo chown -R $USER:$USER "$APP_DIR"
 
             if [ ! -d "$APP_DIR/.git" ]; then
+              echo "⬇️ Cloning repository into $APP_DIR"
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             else
+              echo "🔄 Pulling latest changes into $APP_DIR"
               cd "$APP_DIR"
               git fetch --prune origin
-              git checkout -B main "origin/main"
+              git checkout -B main origin/main
             fi
 
+            echo "📦 Installing dependencies"
             cd "$APP_DIR"
-            npm install
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+
+            echo "🏗️ Building application"
             npm run build
 
+            echo "🔄 Restarting service: $SERVICE"
             sudo systemctl restart "$SERVICE"
-            sudo systemctl status "$SERVICE" --no-pager
 
+            echo "📋 Checking service status"
+            sudo systemctl status "$SERVICE" --no-pager || true
 
-            # Restart service
-            sudo systemctl restart "$SERVICE"
+            echo "✅ Deployment finished at $(date)"
