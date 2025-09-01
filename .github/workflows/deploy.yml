@@ -21,26 +21,43 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -euo pipefail
-            echo "🚀 Starting deployment at $(date)"
+            echo "🚀 Start $(date)"
 
             APP_DIR=${{ secrets.VPS_APP_PATH }}
             SERVICE=${{ secrets.SERVICE_NAME }}
+            PORT=${{ secrets.APP_PORT || 3000 }}
+            DOMAIN=${{ secrets.HEALTH_DOMAIN || 'smoothiekingcaters.com' }}
 
-            echo "📂 Ensuring app directory exists: $APP_DIR"
+            retry() {  # retry <max> <delay> <cmd...>
+              local -r max="$1"; shift
+              local -r delay="$1"; shift
+              local n=1
+              until "$@"; do
+                if [ $n -ge "$max" ]; then
+                  echo "❌ Command failed after $n attempts: $*"
+                  return 1
+                fi
+                echo "⏳ Attempt $((n+1))/$max in ${delay}s: $*"
+                n=$((n+1))
+                sleep "$delay"
+              done
+            }
+
+            echo "📂 Ensure app dir exists: $APP_DIR"
             sudo mkdir -p "$APP_DIR"
             sudo chown -R $USER:$USER "$APP_DIR"
 
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "⬇️ Cloning repository into $APP_DIR"
+              echo "⬇️ Clone repo"
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             else
-              echo "🔄 Pulling latest changes into $APP_DIR"
+              echo "🔄 Update repo"
               cd "$APP_DIR"
               git fetch --prune origin
               git checkout -B main origin/main
             fi
 
-            echo "📦 Installing dependencies"
+            echo "📦 Install deps"
             cd "$APP_DIR"
             if [ -f package-lock.json ]; then
               npm ci
@@ -48,13 +65,20 @@ jobs:
               npm install
             fi
 
-            echo "🏗️ Building application"
+            echo "🏗️ Build"
             npm run build
 
-            echo "🔄 Restarting service: $SERVICE"
+            echo "🔄 Restart service: $SERVICE"
             sudo systemctl restart "$SERVICE"
-
-            echo "📋 Checking service status"
             sudo systemctl status "$SERVICE" --no-pager || true
 
-            echo "✅ Deployment finished at $(date)"
+            echo "🔁 Reload Nginx"
+            sudo systemctl reload nginx
+
+            echo "🩺 Health check (local http://127.0.0.1:$PORT)"
+            retry 30 2 curl -fsS "http://127.0.0.1:${PORT}" >/dev/null
+
+            echo "🌎 Health check (public https://${DOMAIN})"
+            retry 30 2 curl -fsSIL "https://${DOMAIN}" >/dev/null
+
+            echo "✅ Done $(date)"
