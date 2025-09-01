@@ -10,63 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (for info only)
         uses: actions/checkout@v4
 
-      # 1) Quick SSH sanity check
-      - name: Test SSH connection
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            echo "✅ SSH ok"; whoami; hostname
-
-      # 2) Ensure Node.js available on VPS
-      - name: Install Node.js on VPS
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            set -e
-            if ! command -v node >/dev/null 2>&1; then
-              echo "📦 Installing Node.js 18.x..."
-              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-              sudo apt-get install -y nodejs build-essential
-            else
-              echo "✅ Node.js present"; node -v; npm -v
-            fi
-
-      # 3) PM2 + log rotation + tail nginx logs
-      - name: Install PM2 and configure logs
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            set -e
-            if ! command -v pm2 >/dev/null 2>&1; then
-              echo "📦 Installing PM2..."
-              sudo npm install -g pm2
-            fi
-            echo "⚙️ pm2-logrotate"
-            pm2 install pm2-logrotate || true
-            pm2 set pm2-logrotate:max_size 10M
-            pm2 set pm2-logrotate:retain 10
-
-            echo "📂 Tail nginx logs via PM2"
-            sudo mkdir -p /var/log/nginx
-            pm2 describe nginx-access >/dev/null 2>&1 || pm2 start tail --name "nginx-access" -- -f /var/log/nginx/access.log
-            pm2 describe nginx-error  >/dev/null 2>&1 || pm2 start tail --name "nginx-error"  -- -f /var/log/nginx/error.log
-            pm2 startup systemd -u $USER --hp $HOME || true
-            pm2 save
-
-      # 4) Deploy, build, restart, reload nginx, health check
-      - name: Deploy Next.js app
+      - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -74,69 +21,111 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -euo pipefail
-            echo "🚀 Start $(date)"
 
-            APP_DIR=${{ secrets.VPS_APP_PATH }}
-            SERVICE=${{ secrets.SERVICE_NAME }}
-            PORT=${{ secrets.APP_PORT || 3000 }}
-            DOMAIN=${{ secrets.HEALTH_DOMAIN || 'smoothiekingcaters.com' }}
+            # --------------------------
+            # Config from GitHub Secrets
+            # --------------------------
+            APP_DIR="${{ secrets.VPS_APP_PATH }}"
+            SERVICE="${{ secrets.SERVICE_NAME }}"
+            REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+            COMMIT_SHA="${GITHUB_SHA}"
 
-            retry() {  # retry <max> <delay> <cmd...>
-              local -r max="$1"; shift
-              local -r delay="$1"; shift
-              local n=1
-              until "$@"; do
-                if [ $n -ge "$max" ]; then
-                  echo "❌ Failed after $n attempts: $*"
-                  return 1
-                fi
-                echo "⏳ Retry $((n+1))/$max in ${delay}s: $*"
-                n=$((n+1))
-                sleep "$delay"
-              done
-            }
-
-            echo "📂 Ensure $APP_DIR"
-            sudo mkdir -p "$APP_DIR"
-            sudo chown -R $USER:$USER "$APP_DIR"
-
-            if [ -d "$APP_DIR/.git" ]; then
-              echo "🔄 Update repo"
-              cd "$APP_DIR"
-              git fetch --prune origin
-              git reset --hard origin/main
-            else
-              echo "⬇️ Clone repo"
-              git clone https://github.com/${{ github.repository }} "$APP_DIR"
-              cd "$APP_DIR"
+            # ---------------------------------------------
+            # Helper: choose sudo flavor (password or -n)
+            # ---------------------------------------------
+            SUDO="sudo -n"
+            if ! $SUDO true 2>/dev/null; then
+              if [ -n "${{ secrets.SUDO_PASS }}" ]; then
+                # shellcheck disable=SC2016
+                SUDO='echo "${{ secrets.SUDO_PASS }}" | sudo -S'
+                # verify the password works
+                eval "$SUDO true" >/dev/null
+              else
+                echo "⚠️  sudo requires a password but SUDO_PASS is not set. Either:"
+                echo "   • add SUDO_PASS secret (deploy user's sudo password), or"
+                echo "   • set VPS_USER=root, or"
+                echo "   • preinstall Node/PM2/git manually."
+                exit 1
+              fi
             fi
 
-            echo "📦 Install deps"
+            # --------------------------
+            # Ensure base packages exist
+            # --------------------------
+            if ! command -v git >/dev/null 2>&1; then
+              eval "$SUDO apt-get update -y"
+              eval "$SUDO apt-get install -y git"
+            fi
+
+            if ! command -v node >/dev/null 2>&1; then
+              echo "Installing Node.js LTS…"
+              curl -fsSL https://deb.nodesource.com/setup_lts.x | eval "$SUDO bash -"
+              eval "$SUDO apt-get install -y nodejs build-essential"
+              node -v && npm -v
+            fi
+
+            if ! command -v pm2 >/dev/null 2>&1; then
+              echo "Installing PM2…"
+              eval "$SUDO npm install -g pm2"
+              # Make PM2 resurrect on reboot for this user
+              pm2 startup systemd -u "$USER" --hp "$HOME" >/dev/null || true
+              pm2 save || true
+            fi
+
+            # --------------------------
+            # Prepare application folder
+            # --------------------------
+            mkdir -p "$APP_DIR"
+            # Ensure current SSH user owns the app dir
+            eval "$SUDO chown -R $USER:$USER \"$APP_DIR\""
+
+            # --------------------------
+            # Clone or update repository
+            # --------------------------
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "Cloning $REPO_URL into $APP_DIR"
+              git clone "$REPO_URL" "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+
+            # Make sure the worktree matches the pushed commit
+            git fetch --prune origin
+            git checkout -B main origin/main
+            git reset --hard "$COMMIT_SHA"
+
+            # --------------------------
+            # Install deps & Build
+            # --------------------------
             if [ -f package-lock.json ]; then
               npm ci
             else
               npm install
             fi
 
-            echo "🏗️ Build"
             npm run build
 
-            echo "🔄 Restart (systemd)"
-            sudo systemctl restart "$SERVICE"
-            sudo systemctl status "$SERVICE" --no-pager || true
+            # --------------------------
+            # (Re)start with PM2
+            # --------------------------
+            if pm2 describe "$SERVICE" >/dev/null 2>&1; then
+              pm2 restart "$SERVICE"
+            else
+              # Start "npm start" as a managed process
+              pm2 start npm --name "$SERVICE" -- start
+            fi
 
-            echo "🔄 Restart (PM2)"
-            pm2 delete "$SERVICE" || true
-            pm2 start npm --name "$SERVICE" -- start
             pm2 save
 
-            echo "🔁 Reload nginx"
-            sudo nginx -t && sudo systemctl reload nginx
-
-            echo "🩺 Health (local) http://127.0.0.1:$PORT"
-            retry 30 2 curl -fsS "http://127.0.0.1:${PORT}" >/dev/null
-
-            echo "🌎 Health (public) https://${DOMAIN}"
-            retry 30 2 curl -fsSIL "https://${DOMAIN}" >/dev/null
-
-            echo "✅ Done $(date)"
+            # --------------------------
+            # Reload nginx if present
+            # --------------------------
+            if command -v nginx >/dev/null 2>&1; then
+              if eval "$SUDO nginx -t"; then
+                eval "$SUDO systemctl reload nginx"
+              else
+                echo "⚠️  nginx config test failed; not reloading."
+              fi
+            else
+              echo "ℹ️  nginx not installed; skipping reload."
+            fi
