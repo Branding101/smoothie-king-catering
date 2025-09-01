@@ -10,10 +10,63 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (for info only)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Deploy over SSH
+      # 1) Quick SSH sanity check
+      - name: Test SSH connection
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            echo "✅ SSH ok"; whoami; hostname
+
+      # 2) Ensure Node.js available on VPS
+      - name: Install Node.js on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            if ! command -v node >/dev/null 2>&1; then
+              echo "📦 Installing Node.js 18.x..."
+              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+              sudo apt-get install -y nodejs build-essential
+            else
+              echo "✅ Node.js present"; node -v; npm -v
+            fi
+
+      # 3) PM2 + log rotation + tail nginx logs
+      - name: Install PM2 and configure logs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            if ! command -v pm2 >/dev/null 2>&1; then
+              echo "📦 Installing PM2..."
+              sudo npm install -g pm2
+            fi
+            echo "⚙️ pm2-logrotate"
+            pm2 install pm2-logrotate || true
+            pm2 set pm2-logrotate:max_size 10M
+            pm2 set pm2-logrotate:retain 10
+
+            echo "📂 Tail nginx logs via PM2"
+            sudo mkdir -p /var/log/nginx
+            pm2 describe nginx-access >/dev/null 2>&1 || pm2 start tail --name "nginx-access" -- -f /var/log/nginx/access.log
+            pm2 describe nginx-error  >/dev/null 2>&1 || pm2 start tail --name "nginx-error"  -- -f /var/log/nginx/error.log
+            pm2 startup systemd -u $USER --hp $HOME || true
+            pm2 save
+
+      # 4) Deploy, build, restart, reload nginx, health check
+      - name: Deploy Next.js app
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -34,31 +87,31 @@ jobs:
               local n=1
               until "$@"; do
                 if [ $n -ge "$max" ]; then
-                  echo "❌ Command failed after $n attempts: $*"
+                  echo "❌ Failed after $n attempts: $*"
                   return 1
                 fi
-                echo "⏳ Attempt $((n+1))/$max in ${delay}s: $*"
+                echo "⏳ Retry $((n+1))/$max in ${delay}s: $*"
                 n=$((n+1))
                 sleep "$delay"
               done
             }
 
-            echo "📂 Ensure app dir exists: $APP_DIR"
+            echo "📂 Ensure $APP_DIR"
             sudo mkdir -p "$APP_DIR"
             sudo chown -R $USER:$USER "$APP_DIR"
 
-            if [ ! -d "$APP_DIR/.git" ]; then
-              echo "⬇️ Clone repo"
-              git clone https://github.com/${{ github.repository }} "$APP_DIR"
-            else
+            if [ -d "$APP_DIR/.git" ]; then
               echo "🔄 Update repo"
               cd "$APP_DIR"
               git fetch --prune origin
-              git checkout -B main origin/main
+              git reset --hard origin/main
+            else
+              echo "⬇️ Clone repo"
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
+              cd "$APP_DIR"
             fi
 
             echo "📦 Install deps"
-            cd "$APP_DIR"
             if [ -f package-lock.json ]; then
               npm ci
             else
@@ -68,17 +121,22 @@ jobs:
             echo "🏗️ Build"
             npm run build
 
-            echo "🔄 Restart service: $SERVICE"
+            echo "🔄 Restart (systemd)"
             sudo systemctl restart "$SERVICE"
             sudo systemctl status "$SERVICE" --no-pager || true
 
-            echo "🔁 Reload Nginx"
-            sudo systemctl reload nginx
+            echo "🔄 Restart (PM2)"
+            pm2 delete "$SERVICE" || true
+            pm2 start npm --name "$SERVICE" -- start
+            pm2 save
 
-            echo "🩺 Health check (local http://127.0.0.1:$PORT)"
+            echo "🔁 Reload nginx"
+            sudo nginx -t && sudo systemctl reload nginx
+
+            echo "🩺 Health (local) http://127.0.0.1:$PORT"
             retry 30 2 curl -fsS "http://127.0.0.1:${PORT}" >/dev/null
 
-            echo "🌎 Health check (public https://${DOMAIN})"
+            echo "🌎 Health (public) https://${DOMAIN}"
             retry 30 2 curl -fsSIL "https://${DOMAIN}" >/dev/null
 
             echo "✅ Done $(date)"
