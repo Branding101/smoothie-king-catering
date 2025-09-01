@@ -20,7 +20,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            echo "==> Deploy script started on $(date)"
+            echo "==> 🚀 Deploy script started on $(date)"
             set -euo pipefail
 
             # ---- Config ----
@@ -85,5 +85,5 @@ jobs:
             echo "==> Reload nginx if present"
             sudo nginx -t && sudo systemctl reload nginx || true
 
-            echo "==> Done."
+            echo "==> ✅ Deploy script completed successfully on $(date)"
 
