@@ -8,8 +8,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout (for info only)
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
@@ -19,32 +20,30 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            set -euo pipefail
-            APP_DIR=/var/www/smoothieking
-            SERVICE=smoothieking
+            set -euo pipefail   # <---- this is the line you add
+            echo "✅ Starting deployment at $(date)"
 
-            # Create app dir if missing
+            APP_DIR=${{ secrets.VPS_APP_PATH }}
+            SERVICE=${{ secrets.SERVICE_NAME }}
+
             sudo mkdir -p "$APP_DIR"
             sudo chown -R $USER:$USER "$APP_DIR"
 
             if [ ! -d "$APP_DIR/.git" ]; then
-              git clone https://github.com/Branding101/smoothie-king-catering.git "$APP_DIR"
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
             else
               cd "$APP_DIR"
               git fetch --prune origin
-              git checkout -B main origin/main
+              git checkout -B main "origin/main"
             fi
 
             cd "$APP_DIR"
-
-            # Install dependencies and build
-            if [ -f package-lock.json ]; then
-              npm ci
-            else
-              npm install
-            fi
-
+            npm install
             npm run build
+
+            sudo systemctl restart "$SERVICE"
+            sudo systemctl status "$SERVICE" --no-pager
+
 
             # Restart service
             sudo systemctl restart "$SERVICE"
