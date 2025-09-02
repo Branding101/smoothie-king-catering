@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (for info only)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
@@ -19,33 +19,77 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
           script: |
+            echo "==> 🚦 Sanity: running on $(whoami)@$(hostname) at $(date)"
             set -euo pipefail
-            APP_DIR="${{ secrets.VPS_PATH }}"
+
+            # --- Config (from secrets) ---
+            APP_DIR="${{ secrets.VPS_APP_DIR }}"
             SERVICE="${{ secrets.SERVICE_NAME }}"
+            REPO_SSH="git@github.com:Branding101/smoothie-king-catering.git"
+            NODE_VERSION_LTS_SETUP="https://deb.nodesource.com/setup_lts.x"
 
-            sudo mkdir -p "$APP_DIR"
-            sudo chown -R $USER:$USER "$APP_DIR"
+            # --- Validate required vars early ---
+            echo "==> Using APP_DIR='${APP_DIR}', SERVICE='${SERVICE}'"
+            test -n "${APP_DIR}" || { echo "APP_DIR is empty"; exit 1; }
+            test -n "${SERVICE}" || { echo "SERVICE is empty"; exit 1; }
 
-            if [ ! -d "$APP_DIR/.git" ]; then
-              git clone https://github.com/${{ github.repository }} "$APP_DIR"
+            echo "==> Ensure base packages"
+            sudo apt-get update -y
+            sudo apt-get install -y curl ca-certificates gnupg git build-essential nginx
+
+            echo "==> Ensure Node.js LTS + npm"
+            if ! command -v node >/dev/null 2>&1; then
+              curl -fsSL ${NODE_VERSION_LTS_SETUP} | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+            node -v
+            npm -v
+
+            echo "==> Ensure PM2"
+            if ! command -v pm2 >/dev/null 2>&1; then
+              sudo npm i -g pm2
+              sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ${USER} --hp ${HOME} >/dev/null 2>&1 || true
+            fi
+            pm2 -v
+
+            echo "==> Create app directory & permissions"
+            sudo mkdir -p "${APP_DIR}"
+            sudo chown -R "${USER}:${USER}" "${APP_DIR}"
+
+            echo "==> Fetch source code"
+            if [ ! -d "${APP_DIR}/.git" ]; then
+              git clone "${REPO_SSH}" "${APP_DIR}"
             else
-              cd "$APP_DIR"
+              cd "${APP_DIR}"
               git fetch --prune origin
-              git checkout -B main "${{ github.sha }}"
             fi
 
-            cd "$APP_DIR"
+            echo "==> Checkout latest commit"
+            cd "${APP_DIR}"
+            git checkout -B main origin/main
 
+            echo "==> Install dependencies"
             if [ -f package-lock.json ]; then
               npm ci
             else
               npm install
             fi
 
+            echo "==> Build application"
             npm run build
 
-            sudo systemctl restart "$SERVICE"
-            sudo systemctl status "$SERVICE" --no-pager || true
-            sudo nginx -t && sudo systemctl reload nginx
+            echo "==> Run with PM2"
+            if pm2 list | grep -q "${SERVICE}"; then
+              pm2 reload "${SERVICE}"
+            else
+              pm2 start npm --name "${SERVICE}" -- start
+            fi
+            pm2 save
+
+            echo "==> Reload nginx if present"
+            sudo nginx -t && sudo systemctl reload nginx || true
+
+            echo "==> ✅ Deploy finished at $(date)"
 
