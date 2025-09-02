@@ -9,16 +9,17 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Optional: use secrets if you have them; the script also has safe fallbacks.
+    # Pull values from secrets and pass them into the remote session
     env:
       APP_DIR: ${{ secrets.VPS_APP_DIR }}
       SERVICE: ${{ secrets.SERVICE_NAME }}
-      # Switch HTTPS/SSH as you prefer. HTTPS works without a deploy key if repo is public.
+      # Use HTTPS clone (works for public repos without deploy key).
       REPO_URL: https://github.com/Branding101/smoothie-king-catering.git
+      # If switching to SSH + Deploy Key later, set:
       # REPO_URL: git@github.com:Branding101/smoothie-king-catering.git
 
     steps:
-      - name: Checkout repository (not used on server; keeps run metadata)
+      - name: Checkout repository (for run metadata only)
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
@@ -28,28 +29,28 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
-          # Export env vars into remote session
+          # Export these env vars into the remote shell session:
           envs: APP_DIR,SERVICE,REPO_URL
           script: |
             echo "==> 🚦 Starting deploy on $(whoami)@$(hostname) at $(date)"
             set -euo pipefail
 
-            # --- Config & fallbacks (secrets optional) ---
-            APP_DIR="${APP_DIR:-/var/www/smoothieking}"
-            SERVICE="${SERVICE:-smoothieking}"
-            REPO_URL="${REPO_URL:-https://github.com/Branding101/smoothie-king-catering.git}"
+            # --- Validate inputs early ---
+            test -n "${APP_DIR:-}" || { echo "APP_DIR is empty (check secrets)"; exit 1; }
+            test -n "${SERVICE:-}" || { echo "SERVICE is empty (check secrets)"; exit 1; }
+
             NODE_VERSION_LTS_SETUP="https://deb.nodesource.com/setup_lts.x"
 
             echo "==> Using APP_DIR='${APP_DIR}'"
             echo "==> Using SERVICE='${SERVICE}'"
             echo "==> Using REPO_URL='${REPO_URL}'"
 
-            # --- Base packages ---
+            # --- Ensure base packages ---
             echo "==> Ensure base packages"
             sudo apt-get update -y
             sudo apt-get install -y curl ca-certificates gnupg git build-essential nginx
 
-            # --- Node/npm ---
+            # --- Ensure Node.js LTS + npm ---
             echo "==> Ensure Node.js LTS + npm"
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL ${NODE_VERSION_LTS_SETUP} | sudo -E bash -
@@ -58,7 +59,7 @@ jobs:
             node -v
             npm -v
 
-            # --- PM2 (process manager) ---
+            # --- Ensure PM2 ---
             echo "==> Ensure PM2"
             if ! command -v pm2 >/dev/null 2>&1; then
               sudo npm i -g pm2
@@ -71,7 +72,7 @@ jobs:
             sudo mkdir -p "${APP_DIR}"
             sudo chown -R "${USER}:${USER}" "${APP_DIR}"
 
-            # --- Robust clone/backup logic (Option B) ---
+            # --- Robust clone/backup logic ---
             echo "==> Fetch source code"
             if [ -d "${APP_DIR}/.git" ]; then
               echo "• Git repo exists. Fetching latest..."
@@ -80,6 +81,7 @@ jobs:
             elif [ -d "${APP_DIR}" ] && [ "$(ls -A "${APP_DIR}")" ]; then
               echo "• Directory exists but is NOT a git repo. Backing up & cloning fresh..."
               ts=$(date +%s)
+              # requires sudoers to allow mv (add /usr/bin/mv or /bin/mv)
               sudo mv "${APP_DIR}" "${APP_DIR}.bak-${ts}"
               git clone "${REPO_URL}" "${APP_DIR}"
             else
@@ -87,10 +89,9 @@ jobs:
               git clone "${REPO_URL}" "${APP_DIR}"
             fi
 
-            # --- Checkout target branch ---
+            # --- Checkout branch ---
             echo "==> Checkout latest main"
             cd "${APP_DIR}"
-            # Prefer origin/main if present; fallback to main
             if git rev-parse --verify origin/main >/dev/null 2>&1; then
               git checkout -B main origin/main
             else
@@ -109,12 +110,12 @@ jobs:
             echo "==> Build application"
             npm run build
 
-            # --- Run with PM2 ---
+            # --- PM2 start/reload ---
             echo "==> Start/Reload via PM2"
             if pm2 list | grep -q "${SERVICE}"; then
               pm2 reload "${SERVICE}"
             else
-              # expects "start": "next start -p 3000" in package.json
+              # requires "start": "next start -p 3000" in package.json
               pm2 start npm --name "${SERVICE}" -- start
             fi
             pm2 save
