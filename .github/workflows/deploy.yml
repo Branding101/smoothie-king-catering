@@ -9,10 +9,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    env:
-      APP_DIR: ${{ secrets.VPS_APP_DIR }}
-      SERVICE: ${{ secrets.SERVICE_NAME }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,18 +20,17 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
-          # ⬇️ This line exports env vars into remote session
-          envs: APP_DIR,SERVICE
           script: |
             echo "==> 🚦 Sanity: running on $(whoami)@$(hostname) at $(date)"
             set -euo pipefail
 
+            # Hardcoded values just for test
+            APP_DIR="/var/www/smoothieking"
+            SERVICE="smoothieking"
             REPO_SSH="git@github.com:Branding101/smoothie-king-catering.git"
             NODE_VERSION_LTS_SETUP="https://deb.nodesource.com/setup_lts.x"
 
             echo "==> Using APP_DIR='${APP_DIR}', SERVICE='${SERVICE}'"
-            test -n "${APP_DIR}" || { echo "APP_DIR is empty"; exit 1; }
-            test -n "${SERVICE}" || { echo "SERVICE is empty"; exit 1; }
 
             echo "==> Ensure base packages"
             sudo apt-get update -y
