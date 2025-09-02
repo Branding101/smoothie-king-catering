@@ -9,48 +9,37 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Pull values from secrets and pass them into the remote session
-    env:
-      APP_DIR: ${{ secrets.VPS_APP_DIR }}
-      SERVICE: ${{ secrets.SERVICE_NAME }}
-      # Use HTTPS clone (works for public repos without deploy key).
-      REPO_URL: https://github.com/Branding101/smoothie-king-catering.git
-      # If switching to SSH + Deploy Key later, set:
-      # REPO_URL: git@github.com:Branding101/smoothie-king-catering.git
-
     steps:
-      - name: Checkout repository (for run metadata only)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          port: 22
-          # Export these env vars into the remote shell session:
-          envs: APP_DIR,SERVICE,REPO_URL
+          host: ${{ secrets.VPS_HOST }}         # keep as secret
+          username: ${{ secrets.VPS_USER }}     # keep as secret
+          key: ${{ secrets.VPS_SSH_KEY }}       # keep as secret
           script: |
-            echo "==> 🚦 Starting deploy on $(whoami)@$(hostname) at $(date)"
+            echo "==> 🚀 Starting deploy on $(whoami)@$(hostname) at $(date)"
             set -euo pipefail
 
-            # --- Validate inputs early ---
-            test -n "${APP_DIR:-}" || { echo "APP_DIR is empty (check secrets)"; exit 1; }
-            test -n "${SERVICE:-}" || { echo "SERVICE is empty (check secrets)"; exit 1; }
-
+            # --- Hardcoded config (no repo secrets needed) ---
+            APP_DIR="/var/www/smoothieking"
+            SERVICE="smoothieking"
+            REPO_URL="https://github.com/Branding101/smoothie-king-catering.git"
             NODE_VERSION_LTS_SETUP="https://deb.nodesource.com/setup_lts.x"
 
-            echo "==> Using APP_DIR='${APP_DIR}'"
-            echo "==> Using SERVICE='${SERVICE}'"
-            echo "==> Using REPO_URL='${REPO_URL}'"
+            echo "==> Using:"
+            echo "    APP_DIR   = ${APP_DIR}"
+            echo "    SERVICE   = ${SERVICE}"
+            echo "    REPO_URL  = ${REPO_URL}"
 
-            # --- Ensure base packages ---
+            # --- Base packages ---
             echo "==> Ensure base packages"
             sudo apt-get update -y
             sudo apt-get install -y curl ca-certificates gnupg git build-essential nginx
 
-            # --- Ensure Node.js LTS + npm ---
+            # --- Node/npm ---
             echo "==> Ensure Node.js LTS + npm"
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL ${NODE_VERSION_LTS_SETUP} | sudo -E bash -
@@ -59,7 +48,7 @@ jobs:
             node -v
             npm -v
 
-            # --- Ensure PM2 ---
+            # --- PM2 ---
             echo "==> Ensure PM2"
             if ! command -v pm2 >/dev/null 2>&1; then
               sudo npm i -g pm2
@@ -67,7 +56,7 @@ jobs:
             fi
             pm2 -v
 
-            # --- Prepare target dir ---
+            # --- Prepare app directory ---
             echo "==> Create app dir & set ownership"
             sudo mkdir -p "${APP_DIR}"
             sudo chown -R "${USER}:${USER}" "${APP_DIR}"
@@ -79,17 +68,16 @@ jobs:
               cd "${APP_DIR}"
               git fetch --prune origin
             elif [ -d "${APP_DIR}" ] && [ "$(ls -A "${APP_DIR}")" ]; then
-              echo "• Directory exists but is NOT a git repo. Backing up & cloning fresh..."
+              echo "• Directory exists but not a git repo. Backing up & cloning fresh..."
               ts=$(date +%s)
-              # requires sudoers to allow mv (add /usr/bin/mv or /bin/mv)
               sudo mv "${APP_DIR}" "${APP_DIR}.bak-${ts}"
               git clone "${REPO_URL}" "${APP_DIR}"
             else
-              echo "• Directory empty/missing. Cloning fresh..."
+              echo "• Directory empty or missing. Cloning fresh..."
               git clone "${REPO_URL}" "${APP_DIR}"
             fi
 
-            # --- Checkout branch ---
+            # --- Checkout main ---
             echo "==> Checkout latest main"
             cd "${APP_DIR}"
             if git rev-parse --verify origin/main >/dev/null 2>&1; then
@@ -99,7 +87,7 @@ jobs:
               git pull --ff-only || true
             fi
 
-            # --- Install & build ---
+            # --- Install dependencies ---
             echo "==> Install dependencies"
             if [ -f package-lock.json ]; then
               npm ci
@@ -107,27 +95,23 @@ jobs:
               npm install
             fi
 
+            # --- Build app ---
             echo "==> Build application"
             npm run build
 
-            # --- PM2 start/reload ---
-            echo "==> Start/Reload via PM2"
+            # --- Run with PM2 ---
+            echo "==> Start/Reload with PM2"
             if pm2 list | grep -q "${SERVICE}"; then
               pm2 reload "${SERVICE}"
             else
-              # requires "start": "next start -p 3000" in package.json
+              # expects "start": "next start -p 3000" in package.json
               pm2 start npm --name "${SERVICE}" -- start
             fi
             pm2 save
 
             # --- Nginx sanity ---
-            echo "==> Reload nginx if config is valid"
+            echo "==> Reload nginx if config valid"
             sudo nginx -t && sudo systemctl reload nginx || true
 
-            # --- Lightweight post-checks ---
-            echo "==> Post-deploy checks"
-            pm2 status "${SERVICE}" || true
-            curl -sfI http://127.0.0.1:3000 || true
-
-            echo "==> ✅ Deploy finished at $(date)"
+            echo "==> ✅ Deploy completed at $(date)"
 
